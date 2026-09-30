@@ -7,5 +7,6 @@
 bool GroveRTC_Init(void);
 bool GroveRTC_GetDateTime(RTC_DateTime *dt);
 bool GroveRTC_SetDateTime(const RTC_DateTime *dt);
+bool GroveRTC_ReadWithTimeout(RTC_DateTime *dt, uint32_t timeout_ms);
 
 #endif

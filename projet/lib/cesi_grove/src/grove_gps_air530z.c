@@ -121,3 +121,19 @@ bool GroveGPS_ReadGGA(GPS_Data *gps, unsigned int timeout_ms)
 
     return false;
 }
+
+bool GroveGPS_ReadWithTimeout(GPS_Data *gps, uint32_t timeout_ms)
+{
+    uint32_t debut = HAL_GetTick();
+    uint32_t ecoule;
+    do
+    {
+        ecoule = HAL_GetTick() - debut;
+        if (GroveGPS_ReadGGA(gps, timeout_ms - ecoule) && gps->valid)
+        {
+            return true;
+        }
+    }
+    while ((HAL_GetTick() - debut) < timeout_ms);
+    return false;
+}

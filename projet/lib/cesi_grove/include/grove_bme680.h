@@ -7,5 +7,6 @@
 bool GroveBME680_Init(void);
 bool GroveBME680_ReadChipId(uint8_t *chip_id);
 bool GroveBME680_ReadEnvironment(Env_Data *data);
+bool GroveBME680_ReadWithTimeout(Env_Data *env, uint32_t timeout_ms);
 
 #endif

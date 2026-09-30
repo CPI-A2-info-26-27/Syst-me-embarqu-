@@ -6,6 +6,7 @@ extern I2C_HandleTypeDef GROVE_I2C_HANDLE;
 #define BME680_ADDR_DEFAULT (0x76 << 1)
 #define BME680_REG_ID      0xD0
 #define BME680_REG_RESET   0xE0
+#define PAUSE_ENTRE_ESSAIS_MS 100U
 
 static uint16_t bme680_addr = BME680_ADDR_DEFAULT;
 
@@ -68,4 +69,21 @@ bool GroveBME680_ReadEnvironment(Env_Data *data)
     data->gas_resistance_ohm = 0.0f;
 
     return true;
+}
+
+bool GroveBME680_ReadWithTimeout(Env_Data *env, uint32_t timeout_ms)
+{
+    uint8_t id = 0;
+    uint32_t debut = HAL_GetTick();
+    do
+    {
+        if (GroveBME680_ReadChipId(&id) && id == 0x61 &&
+            GroveBME680_ReadEnvironment(env))
+        {
+            return true;
+        }
+        HAL_Delay(PAUSE_ENTRE_ESSAIS_MS);
+    }
+    while ((HAL_GetTick() - debut) < timeout_ms);
+    return false;
 }
