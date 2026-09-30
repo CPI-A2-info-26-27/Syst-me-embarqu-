@@ -1,7 +1,11 @@
 #include "sd_logger.h"
 #include "board_pins.h"
 #include "stm32l4xx_hal.h"
+#include "grove_rtc_ds1307.h"
+#include "fatfs/ff.h"
+#include "fatfs/diskio.h"
 #include <stdio.h>
+#include <string.h>
 
 #define SD_CMD0     0
 #define SD_CMD1     1
@@ -16,6 +20,29 @@
 #define SD_INIT_TIMEOUT_MS 1000U
 #define SD_POWERUP_DELAY_MS 50U
 
+#define SD_CMD9     9
+#define SD_CMD12    12
+#define SD_CMD16    16
+#define SD_CMD17    17
+#define SD_CMD18    18
+#define SD_CMD24    24
+#define SD_CMD25    25
+
+#define SD_BLOCK_SIZE           512U
+#define SD_TOKEN_START_BLOCK    0xFEU
+#define SD_TOKEN_START_MULTI    0xFCU
+#define SD_TOKEN_STOP_TRAN      0xFDU
+#define SD_DATA_RESP_MASK       0x1FU
+#define SD_DATA_RESP_ACCEPTED   0x05U
+#define SD_READ_TIMEOUT_MS      200U
+#define SD_WRITE_TIMEOUT_MS     500U
+
+#define SD_SPI_SLOW_PRESCALER   SPI_BAUDRATEPRESCALER_256
+#define SD_SPI_FAST_MAX_HZ      10000000UL
+
+#define SD_LOG_NAME_SIZE        32U
+#define SD_LOG_MAX_REVISION     9999U
+
 typedef struct
 {
     GPIO_TypeDef *port;
@@ -28,6 +55,13 @@ extern SPI_HandleTypeDef SD_SPI_HANDLE;
 static SDLoggerCardType g_card_type = SDLOGGER_CARD_UNKNOWN;
 static SDLoggerInitStatus g_init_status = SDLOGGER_INIT_ERR_CMD0;
 static uint8_t g_active_cs_index = 0;
+
+static DSTATUS g_disk_status = STA_NOINIT;
+static FATFS g_fatfs;
+static FIL g_fichier;
+static bool g_monte = false;
+static bool g_carte_pleine = false;
+static uint32_t g_max_file_size = SDLOGGER_FILE_MAX_SIZE_DEFAULT;
 
 static const SDChipSelect g_cs_candidates[] = {
     {SD_CS_PORT, SD_CS_PIN, "D4/PB5"}
@@ -446,11 +480,528 @@ bool SDLogger_BitBangCMD0Test(void)
     return false;
 }
 
+static void SD_SetSpiPrescaler(uint32_t prescaler)
+{
+    __HAL_SPI_DISABLE(&SD_SPI_HANDLE);
+    MODIFY_REG(SD_SPI_HANDLE.Instance->CR1, SPI_CR1_BR, prescaler);
+    SD_SPI_HANDLE.Init.BaudRatePrescaler = prescaler;
+    __HAL_SPI_ENABLE(&SD_SPI_HANDLE);
+}
+
+static uint32_t SD_GetFastPrescaler(void)
+{
+    static const uint32_t prescalers[] = {
+        SPI_BAUDRATEPRESCALER_2,  SPI_BAUDRATEPRESCALER_4,
+        SPI_BAUDRATEPRESCALER_8,  SPI_BAUDRATEPRESCALER_16,
+        SPI_BAUDRATEPRESCALER_32, SPI_BAUDRATEPRESCALER_64,
+        SPI_BAUDRATEPRESCALER_128, SPI_BAUDRATEPRESCALER_256
+    };
+    uint32_t pclk = HAL_RCC_GetPCLK2Freq();
+    uint8_t i;
+
+    for (i = 0; i < 8U; ++i)
+    {
+        if ((pclk >> (i + 1U)) <= SD_SPI_FAST_MAX_HZ)
+        {
+            return prescalers[i];
+        }
+    }
+
+    return SPI_BAUDRATEPRESCALER_256;
+}
+
+static bool SD_FinishInit(void)
+{
+    uint8_t r1;
+
+    if (g_card_type == SDLOGGER_CARD_SDSC)
+    {
+        r1 = SD_SendCommand(SD_CMD16, SD_BLOCK_SIZE, 0x01U);
+        SD_Deselect();
+        if (r1 != 0x00U)
+        {
+            return false;
+        }
+    }
+
+    SD_SetSpiPrescaler(SD_GetFastPrescaler());
+    return true;
+}
+
+static uint32_t SD_SectorAddress(DWORD sector)
+{
+    if (g_card_type == SDLOGGER_CARD_SDHC)
+    {
+        return (uint32_t)sector;
+    }
+
+    return (uint32_t)sector * SD_BLOCK_SIZE;
+}
+
+static bool SD_ReceiveDataBlock(uint8_t *buffer, uint32_t len)
+{
+    uint8_t token;
+    uint32_t i;
+    uint32_t start = HAL_GetTick();
+
+    do
+    {
+        token = SD_SPI_Transfer(0xFF);
+    }
+    while ((token == 0xFFU) && ((HAL_GetTick() - start) < SD_READ_TIMEOUT_MS));
+
+    if (token != SD_TOKEN_START_BLOCK)
+    {
+        return false;
+    }
+
+    for (i = 0; i < len; ++i)
+    {
+        buffer[i] = SD_SPI_Transfer(0xFF);
+    }
+
+    (void)SD_SPI_Transfer(0xFF);
+    (void)SD_SPI_Transfer(0xFF);
+
+    return true;
+}
+
+static bool SD_SendDataBlock(const uint8_t *buffer, uint8_t token)
+{
+    uint8_t response;
+    uint32_t i;
+
+    if (!SD_WaitReady(SD_WRITE_TIMEOUT_MS))
+    {
+        return false;
+    }
+
+    (void)SD_SPI_Transfer(token);
+
+    for (i = 0; i < SD_BLOCK_SIZE; ++i)
+    {
+        (void)SD_SPI_Transfer(buffer[i]);
+    }
+
+    (void)SD_SPI_Transfer(0xFF);
+    (void)SD_SPI_Transfer(0xFF);
+
+    response = SD_SPI_Transfer(0xFF);
+    return (response & SD_DATA_RESP_MASK) == SD_DATA_RESP_ACCEPTED;
+}
+
+static void SD_StopTransmission(void)
+{
+    uint8_t frame[6] = {(uint8_t)(0x40U | SD_CMD12), 0x00U, 0x00U, 0x00U, 0x00U, 0x01U};
+    uint8_t i;
+
+    for (i = 0; i < 6U; ++i)
+    {
+        (void)SD_SPI_Transfer(frame[i]);
+    }
+
+    (void)SD_SPI_Transfer(0xFF);
+
+    for (i = 0; i < 10U; ++i)
+    {
+        if ((SD_SPI_Transfer(0xFF) & 0x80U) == 0U)
+        {
+            break;
+        }
+    }
+
+    (void)SD_WaitReady(SD_WRITE_TIMEOUT_MS);
+}
+
+static bool SD_ReadCsd(uint8_t csd[16])
+{
+    bool ok = false;
+
+    if (SD_SendCommand(SD_CMD9, 0x00000000UL, 0x01U) == 0x00U)
+    {
+        ok = SD_ReceiveDataBlock(csd, 16U);
+    }
+    SD_Deselect();
+
+    return ok;
+}
+
+DSTATUS disk_status(BYTE pdrv)
+{
+    if (pdrv != 0U)
+    {
+        return STA_NOINIT;
+    }
+
+    return g_disk_status;
+}
+
+DSTATUS disk_initialize(BYTE pdrv)
+{
+    if (pdrv != 0U)
+    {
+        return STA_NOINIT;
+    }
+
+    if ((g_disk_status & STA_NOINIT) != 0U)
+    {
+        SD_SetSpiPrescaler(SD_SPI_SLOW_PRESCALER);
+        if (SDLogger_Init() && SD_FinishInit())
+        {
+            g_disk_status = 0U;
+        }
+    }
+
+    return g_disk_status;
+}
+
+DRESULT disk_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
+{
+    uint32_t address;
+
+    if ((pdrv != 0U) || (count == 0U))
+    {
+        return RES_PARERR;
+    }
+    if ((g_disk_status & STA_NOINIT) != 0U)
+    {
+        return RES_NOTRDY;
+    }
+
+    address = SD_SectorAddress(sector);
+
+    if (count == 1U)
+    {
+        if ((SD_SendCommand(SD_CMD17, address, 0x01U) == 0x00U) &&
+            SD_ReceiveDataBlock(buff, SD_BLOCK_SIZE))
+        {
+            count = 0U;
+        }
+    }
+    else
+    {
+        if (SD_SendCommand(SD_CMD18, address, 0x01U) == 0x00U)
+        {
+            do
+            {
+                if (!SD_ReceiveDataBlock(buff, SD_BLOCK_SIZE))
+                {
+                    break;
+                }
+                buff += SD_BLOCK_SIZE;
+            }
+            while (--count > 0U);
+
+            SD_StopTransmission();
+        }
+    }
+
+    SD_Deselect();
+
+    return (count == 0U) ? RES_OK : RES_ERROR;
+}
+
+DRESULT disk_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)
+{
+    uint32_t address;
+    bool ok = false;
+
+    if ((pdrv != 0U) || (count == 0U))
+    {
+        return RES_PARERR;
+    }
+    if ((g_disk_status & STA_NOINIT) != 0U)
+    {
+        return RES_NOTRDY;
+    }
+
+    address = SD_SectorAddress(sector);
+
+    if (count == 1U)
+    {
+        ok = (SD_SendCommand(SD_CMD24, address, 0x01U) == 0x00U) &&
+             SD_SendDataBlock(buff, SD_TOKEN_START_BLOCK);
+    }
+    else
+    {
+        if (SD_SendCommand(SD_CMD25, address, 0x01U) == 0x00U)
+        {
+            do
+            {
+                if (!SD_SendDataBlock(buff, SD_TOKEN_START_MULTI))
+                {
+                    break;
+                }
+                buff += SD_BLOCK_SIZE;
+            }
+            while (--count > 0U);
+
+            if (SD_WaitReady(SD_WRITE_TIMEOUT_MS))
+            {
+                (void)SD_SPI_Transfer(SD_TOKEN_STOP_TRAN);
+                (void)SD_SPI_Transfer(0xFF);
+                ok = (count == 0U);
+            }
+        }
+    }
+
+    if (!SD_WaitReady(SD_WRITE_TIMEOUT_MS))
+    {
+        ok = false;
+    }
+    SD_Deselect();
+
+    return ok ? RES_OK : RES_ERROR;
+}
+
+DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff)
+{
+    uint8_t csd[16];
+    uint32_t c_size;
+    uint32_t n;
+    uint32_t write_bl_len;
+    bool ready;
+
+    if (pdrv != 0U)
+    {
+        return RES_PARERR;
+    }
+    if ((g_disk_status & STA_NOINIT) != 0U)
+    {
+        return RES_NOTRDY;
+    }
+
+    switch (cmd)
+    {
+    case CTRL_SYNC:
+        SD_Select();
+        ready = SD_WaitReady(SD_WRITE_TIMEOUT_MS);
+        SD_Deselect();
+        return ready ? RES_OK : RES_ERROR;
+
+    case GET_SECTOR_COUNT:
+        if (!SD_ReadCsd(csd))
+        {
+            return RES_ERROR;
+        }
+        if ((csd[0] >> 6) == 1U)
+        {
+            c_size = (uint32_t)csd[9] | ((uint32_t)csd[8] << 8) | ((uint32_t)(csd[7] & 0x3FU) << 16);
+            *(DWORD *)buff = (DWORD)((c_size + 1U) << 10);
+        }
+        else
+        {
+            n = (uint32_t)(csd[5] & 0x0FU)
+              + ((uint32_t)(csd[10] & 0x80U) >> 7)
+              + ((uint32_t)(csd[9] & 0x03U) << 1)
+              + 2U;
+            c_size = ((uint32_t)csd[8] >> 6)
+                   | ((uint32_t)csd[7] << 2)
+                   | ((uint32_t)(csd[6] & 0x03U) << 10);
+            if (n < 9U)
+            {
+                return RES_ERROR;
+            }
+            *(DWORD *)buff = (DWORD)((c_size + 1U) << (n - 9U));
+        }
+        return RES_OK;
+
+    case GET_SECTOR_SIZE:
+        *(WORD *)buff = (WORD)SD_BLOCK_SIZE;
+        return RES_OK;
+
+    case GET_BLOCK_SIZE:
+        if (!SD_ReadCsd(csd))
+        {
+            return RES_ERROR;
+        }
+        n = (((uint32_t)(csd[10] & 0x3FU) << 1) | ((uint32_t)csd[11] >> 7)) + 1U;
+        write_bl_len = ((uint32_t)(csd[12] & 0x03U) << 2) | ((uint32_t)csd[13] >> 6);
+        *(DWORD *)buff = (write_bl_len >= 9U) ? (DWORD)(n << (write_bl_len - 9U)) : 1U;
+        return RES_OK;
+
+    default:
+        return RES_PARERR;
+    }
+}
+
+DWORD get_fattime(void)
+{
+    RTC_DateTime dt;
+
+    if (!GroveRTC_GetDateTime(&dt) || (dt.month == 0U) || (dt.day == 0U))
+    {
+        return ((DWORD)(2020U - 1980U) << 25) | ((DWORD)1U << 21) | ((DWORD)1U << 16);
+    }
+
+    return ((DWORD)(dt.year - 1980U) << 25)
+         | ((DWORD)dt.month << 21)
+         | ((DWORD)dt.day << 16)
+         | ((DWORD)dt.hours << 11)
+         | ((DWORD)dt.minutes << 5)
+         | ((DWORD)dt.seconds >> 1);
+}
+
+static FRESULT SD_FindFreeRevision(const char *filename, char *name, size_t size)
+{
+    const char *tiret = strrchr(filename, '_');
+    const char *point = strrchr(filename, '.');
+    int longueur_prefixe;
+    uint32_t revision;
+    FRESULT res;
+
+    if ((tiret == 0) || (point == 0) || (point < tiret) ||
+        ((size_t)(tiret - filename) + strlen(point) + 6U >= size))
+    {
+        return FR_INVALID_NAME;
+    }
+
+    longueur_prefixe = (int)(tiret - filename);
+
+    for (revision = 1U; revision <= SD_LOG_MAX_REVISION; ++revision)
+    {
+        (void)snprintf(name, size, "%.*s_%lu%s", longueur_prefixe, filename,
+                       (unsigned long)revision, point);
+        res = f_stat(name, 0);
+        if (res == FR_NO_FILE)
+        {
+            return FR_OK;
+        }
+        if (res != FR_OK)
+        {
+            return res;
+        }
+    }
+
+    return FR_DENIED;
+}
+
+static FRESULT SD_Mount(void)
+{
+    FRESULT res;
+
+    if (g_monte)
+    {
+        return FR_OK;
+    }
+
+    res = f_mount(&g_fatfs, "", 1);
+    g_monte = (res == FR_OK);
+    return res;
+}
+
+static bool SD_WriteFailed(FRESULT res)
+{
+    (void)f_close(&g_fichier);
+
+    if ((res == FR_DISK_ERR) || (res == FR_NOT_READY) || (res == FR_INT_ERR))
+    {
+        g_disk_status = STA_NOINIT;
+    }
+    g_monte = false;
+
+    printf("[SD] erreur FatFs %d\r\n", (int)res);
+    return false;
+}
+
+void SDLogger_SetMaxFileSize(uint32_t max_size)
+{
+    g_max_file_size = max_size;
+}
+
+uint32_t SDLogger_GetMaxFileSize(void)
+{
+    return g_max_file_size;
+}
+
+bool SDLogger_IsCardFull(void)
+{
+    return g_carte_pleine;
+}
+
+void SDLogger_Unmount(void)
+{
+    (void)f_close(&g_fichier);
+    (void)f_mount(0, "", 0);
+    g_monte = false;
+    g_disk_status = STA_NOINIT;
+}
+
 bool SDLogger_WriteLine(const char *filename, const char *line)
 {
-    (void)filename;
-    (void)line;
+    char archive[SD_LOG_NAME_SIZE];
+    FRESULT res;
+    UINT written;
+    UINT line_len;
 
-    /* File write support needs FatFs + diskio SPI. */
-    return false;
+    g_carte_pleine = false;
+
+    if ((filename == 0) || (line == 0))
+    {
+        return false;
+    }
+
+    res = SD_Mount();
+    if (res != FR_OK)
+    {
+        return SD_WriteFailed(res);
+    }
+
+    line_len = (UINT)strlen(line);
+
+    res = f_open(&g_fichier, filename, FA_OPEN_APPEND | FA_WRITE);
+    if (res != FR_OK)
+    {
+        return SD_WriteFailed(res);
+    }
+
+    if ((f_size(&g_fichier) > 0U) &&
+        ((f_size(&g_fichier) + line_len + 2U) > g_max_file_size))
+    {
+        res = f_close(&g_fichier);
+        if (res == FR_OK)
+        {
+            res = SD_FindFreeRevision(filename, archive, sizeof(archive));
+        }
+        if (res == FR_OK)
+        {
+            res = f_rename(filename, archive);
+        }
+        if (res == FR_OK)
+        {
+            res = f_open(&g_fichier, filename, FA_CREATE_ALWAYS | FA_WRITE);
+        }
+        if (res != FR_OK)
+        {
+            return SD_WriteFailed(res);
+        }
+    }
+
+    res = f_write(&g_fichier, line, line_len, &written);
+    if ((res == FR_OK) && (written != line_len))
+    {
+        g_carte_pleine = true;
+        res = FR_DENIED;
+    }
+    if (res == FR_OK)
+    {
+        res = f_write(&g_fichier, "\r\n", 2U, &written);
+        if ((res == FR_OK) && (written != 2U))
+        {
+            g_carte_pleine = true;
+            res = FR_DENIED;
+        }
+    }
+    if (res != FR_OK)
+    {
+        return SD_WriteFailed(res);
+    }
+
+    res = f_close(&g_fichier);
+    if (res != FR_OK)
+    {
+        return SD_WriteFailed(res);
+    }
+
+    return true;
 }

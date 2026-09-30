@@ -4,6 +4,7 @@
 extern I2C_HandleTypeDef GROVE_I2C_HANDLE;
 
 #define DS1307_ADDR (0x68 << 1)
+#define PAUSE_ENTRE_ESSAIS_MS 100U
 
 static uint8_t bcd_to_dec(uint8_t bcd)
 {
@@ -60,4 +61,16 @@ bool GroveRTC_SetDateTime(const RTC_DateTime *dt)
     data[7] = dec_to_bcd((uint8_t)(dt->year - 2000));
 
     return HAL_I2C_Master_Transmit(&GROVE_I2C_HANDLE, DS1307_ADDR, data, 8, 100) == HAL_OK;
+}
+
+bool GroveRTC_ReadWithTimeout(RTC_DateTime *dt, uint32_t timeout_ms)
+{
+    uint32_t debut = HAL_GetTick();
+    do
+    {
+        if (GroveRTC_GetDateTime(dt)) return true;
+        HAL_Delay(PAUSE_ENTRE_ESSAIS_MS);
+    }
+    while ((HAL_GetTick() - debut) < timeout_ms);
+    return false;
 }
