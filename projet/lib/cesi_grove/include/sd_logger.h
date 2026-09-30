@@ -2,6 +2,11 @@
 #define SD_LOGGER_H
 
 #include <stdbool.h>
+#include <stdint.h>
+
+#ifndef SDLOGGER_FILE_MAX_SIZE_DEFAULT
+#define SDLOGGER_FILE_MAX_SIZE_DEFAULT 2048U
+#endif
 
 typedef enum
 {
@@ -26,5 +31,9 @@ SDLoggerInitStatus SDLogger_GetLastInitStatus(void);
 const char *SDLogger_GetActiveCsLabel(void);
 bool SDLogger_BitBangCMD0Test(void);
 bool SDLogger_WriteLine(const char *filename, const char *line);
+void SDLogger_SetMaxFileSize(uint32_t max_size);
+uint32_t SDLogger_GetMaxFileSize(void);
+bool SDLogger_IsCardFull(void);
+void SDLogger_Unmount(void);
 
 #endif

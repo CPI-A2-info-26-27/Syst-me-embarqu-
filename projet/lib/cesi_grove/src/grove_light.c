@@ -1,6 +1,8 @@
 #include "grove_light.h"
 #include "board_pins.h"
 
+#define PAUSE_ENTRE_ESSAIS_MS 100U
+
 ADC_HandleTypeDef hadc1;
 
 void GroveLight_Init(void)
@@ -59,4 +61,17 @@ uint16_t GroveLight_ReadRaw(void)
     HAL_ADC_Stop(&hadc1);
 
     return value;
+}
+
+bool GroveLight_ReadWithTimeout(uint16_t *valeur, uint32_t timeout_ms)
+{
+    uint32_t debut = HAL_GetTick();
+    do
+    {
+        *valeur = GroveLight_ReadRaw();
+        if (*valeur != 0xFFFF) return true;
+        HAL_Delay(PAUSE_ENTRE_ESSAIS_MS);
+    }
+    while ((HAL_GetTick() - debut) < timeout_ms);
+    return false;
 }
