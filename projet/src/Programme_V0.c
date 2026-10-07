@@ -177,29 +177,6 @@ bool TestSDAcces(int TIMEOUT)
   return false;
 }
 
-bool TemperatureCoherente(float t)
-{
-  if (isnan(t)) return false;
-  return t >= MIN_TEMP_AIR && t <= MAX_TEMP_AIR;
-}
-
-bool PressionCoherente(float p)
-{
-  if (isnan(p)) return false;
-  return p >= PRESSURE_MIN && p <= PRESSURE_MAX;
-}
-
-bool HumiditeCoherente(float t)
-{
-  if (isnan(t)) return false;
-  return t >= HYGR_MINT && t <= HYGR_MAXT;
-}
-
-bool LuminositeCoherente(uint16_t v)
-{
-  return v <= 1023;
-}
-
 void ModeStandard(int TIMEOUT = 30, int FILE_MAX_SIZE = 2048)
 {
   led_color(VERT.r, VERT.g, VERT.b);
