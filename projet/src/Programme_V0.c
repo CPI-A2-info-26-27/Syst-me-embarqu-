@@ -2,15 +2,15 @@
 #include <Adafruit_BME280.h>
 #include <ChainableLED.h>
 #include <Wire.h>
-#include "RTClib.h"
+#include <RTClib.h>
 #include <SPI.h>
 #include <SD.h>
 #include <SoftwareSerial.h>
 #include <TinyGPS++.h>
 
-#define PIN_BTN_ROUGE     5
-#define PIN_BTN_VERT      6
-#define PIN_LED_CLK       7
+#define PIN_BTN_VERT      5
+#define PIN_BTN_ROUGE     6
+#define PIN_LED_CLK       8
 #define PIN_LED_DATA      9
 #define PIN_GPS_RX        2
 #define PIN_GPS_TX        3
@@ -32,17 +32,15 @@
 #define NA_GPS       0x10
 #define NA_RTC       0x20
 
-uint16_t LOG_INTERVAL  = 600;
+uint16_t LOG_INTERVAL  = 60;
 uint16_t FILE_MAX_SIZE = 2048;
 uint8_t  TIMEOUT       = 30;
 
-// Seuils fixes : const => pas de RAM utilisee
 const int16_t LUMIN_LOW    = 255;  const int16_t LUMIN_HIGH   = 768;
 const int8_t  MIN_TEMP_AIR = -10;  const int8_t  MAX_TEMP_AIR = 60;
 const uint8_t HYGR_MINT    = 0;    const uint8_t HYGR_MAXT    = 50;
 const int16_t PRESSURE_MIN = 850;  const int16_t PRESSURE_MAX = 1080;
 
-// Mesures : une seule copie en RAM, ecrite directement par les fonctions
 uint16_t LUMIN    = 0;
 float    TEMP_AIR = 0.0f;
 float    HYGR     = 0.0f;
@@ -50,24 +48,27 @@ float    PRESSURE = 0.0f;
 float    GPS_LAT  = 0.0f;
 float    GPS_LON  = 0.0f;
 DateTime RTC_TIME;
-uint8_t  NA_FLAGS = 0;              // 1 bit par mesure "NA" au lieu de chaines
+uint8_t  NA_FLAGS = 0;
 
-char FILE_PATH[13] = "";            // AAMMJJ_0.LOG + '\0'
-uint8_t BIN = 0;
+char FILE_PATH[13] = "";
+uint8_t COMPTEUR_ECO = 0;
 char MODE = 'S';
 char MODE_MEMOIRE = 'S';
-bool debut = true;
+uint8_t num_revision = 0;        // revision du fichier du jour (AAMMJJ_N.LOG)
+uint8_t jour_fichier = 0;        // jour du fichier en cours, pour remettre la revision a 0
+bool premier_releve = true;      // force un releve des le premier passage dans loop()
 uint32_t dernier_releve = 0;
-uint32_t chrono = 0;                // chrono partage par BOUTON() et les Test*()
+uint32_t chrono = 0;
+uint32_t derniere_activite_config = 0;   // dernier appui en mode configuration
+const uint32_t DUREE_INACTIVITE_CONFIG = 30UL * 60UL * 1000UL;   // 30 min sans appui => retour en standard
 uint8_t ETAT_BOUTON = BTN_N;
-File dataFile;
 
 Adafruit_BME280 bme;
 RTC_DS1307 rtc;
 SoftwareSerial gpsSerial(PIN_GPS_RX, PIN_GPS_TX);
 TinyGPSPlus gps;
 
-ChainableLED ledRGB(8,9,1);
+ChainableLED ledRGB(PIN_LED_CLK, PIN_LED_DATA, 1);
 
 typedef struct { uint8_t r, g, b; } Couleur;
 
@@ -93,63 +94,107 @@ const Erreur ERR_VALEURS_CAP PROGMEM = { &ROUGE, &VERT,  1000, 2000 };
 const Erreur ERR_FULL_SD     PROGMEM = { &ROUGE, &BLANC, 1000, 1000 };
 const Erreur ERR_WRITE_SD    PROGMEM = { &ROUGE, &BLANC, 1000, 2000 };
 
-const Erreur *erreur_courante = NULL;   // pointeur (2 octets) vers l'erreur en flash
+const Erreur *erreur_courante = NULL;
+bool     erreur_phase2 = false;       // false : couleur 1, true : couleur 2
+uint32_t debut_phase_erreur = 0;
 
+void SignalerErreur(const Erreur *e)
+{
+  if (erreur_courante == NULL)
+  {
+    erreur_courante = e;
+    erreur_phase2 = false;
+    debut_phase_erreur = millis();
+    led_color((const Couleur *)pgm_read_word(&e->c1));
+  }
+}
+
+// Clignotement non bloquant : les boutons restent lus pendant l'affichage de l'erreur
 void erreur()
 {
-  led_color((const Couleur *)pgm_read_word(&erreur_courante->c1));
-  delay(pgm_read_word(&erreur_courante->d1));
-  led_color((const Couleur *)pgm_read_word(&erreur_courante->c2));
-  delay(pgm_read_word(&erreur_courante->d2));
+  uint16_t duree = pgm_read_word(erreur_phase2 ? &erreur_courante->d2 : &erreur_courante->d1);
+  if (millis() - debut_phase_erreur >= duree)
+  {
+    erreur_phase2 = !erreur_phase2;
+    debut_phase_erreur = millis();
+    led_color((const Couleur *)pgm_read_word(erreur_phase2 ? &erreur_courante->c2 : &erreur_courante->c1));
+  }
+}
+
+extern uint8_t __heap_start;
+extern uint8_t *__brkval;
+#define MOTIF_PILE 0xAA
+
+void PeindrePile()
+{
+  uint8_t marqueur;
+  uint8_t *p = __brkval ? __brkval : &__heap_start;
+  while (p < &marqueur - 16) *p++ = MOTIF_PILE;
+}
+
+uint16_t PileMinLibre()
+{
+  uint8_t marqueur;
+  uint8_t *p = __brkval ? __brkval : &__heap_start;
+  uint16_t libre = 0;
+  uint16_t max_libre = 0;
+  for (; p < &marqueur; p++)
+  {
+    if (*p == MOTIF_PILE)
+    {
+      libre++;
+      if (libre > max_libre) max_libre = libre;
+    }
+    else
+    {
+      libre = 0;
+    }
+  }
+  return max_libre;
+}
+
+// Cablage des boutons :
+//  - bouton entre la broche et GND (aucune resistance)    -> BTN_APPUYE LOW  (INPUT_PULLUP)
+//  - bouton entre la broche et 5V + resistance 10k vers GND -> BTN_APPUYE HIGH (INPUT)
+#define BTN_APPUYE  HIGH
+
+bool Appuye(uint8_t pin)
+{
+  return digitalRead(pin) == BTN_APPUYE;
 }
 
 uint8_t BOUTON()
 {
+  uint8_t pin;
+  if (Appuye(PIN_BTN_ROUGE)) pin = PIN_BTN_ROUGE;
+  else if (Appuye(PIN_BTN_VERT)) pin = PIN_BTN_VERT;
+  else return BTN_N;
+
+  delay(50);
+  if (!Appuye(pin)) return BTN_N;
+
   chrono = millis();
-  if (digitalRead(PIN_BTN_ROUGE) == LOW)
+  while (millis() - chrono < 5000UL)
   {
-    while (millis() - chrono < 5000UL)
+    if (!Appuye(pin))
     {
-      if (digitalRead(PIN_BTN_ROUGE) == HIGH)
-      {
-        return BTN_RC;
-      }
+      delay(50);
+      return (pin == PIN_BTN_ROUGE) ? BTN_RC : BTN_VC;
     }
-    return BTN_RL;
   }
-  if (digitalRead(PIN_BTN_VERT) == LOW)
-  {
-    while (millis() - chrono < 5000UL)
-    {
-      if (digitalRead(PIN_BTN_VERT) == HIGH)
-      {
-        return BTN_VC;
-      }
-    }
-    return BTN_VL;
-  }
-  return BTN_N;
+  while (Appuye(pin)) {}
+  delay(50);
+  return (pin == PIN_BTN_ROUGE) ? BTN_RL : BTN_VL;
 }
 
-bool TemperatureCoherente()
+bool PresentI2C(uint8_t adr)
 {
-  return TEMP_AIR >= MIN_TEMP_AIR && TEMP_AIR <= MAX_TEMP_AIR;
+  Wire.beginTransmission(adr);
+  return Wire.endTransmission() == 0;
 }
 
-bool PressionCoherente()
-{
-  return PRESSURE >= PRESSURE_MIN && PRESSURE <= PRESSURE_MAX;
-}
-
-bool HumiditeCoherente()
-{
-  return HYGR >= HYGR_MINT && HYGR <= HYGR_MAXT;
-}
-
-bool LuminositeCoherente()
-{
-  return LUMIN >= LUMIN_LOW && LUMIN <= LUMIN_HIGH;
-}
+bool rtc_initialisee = false;
+bool bme_initialise = false;
 
 bool TestRTC()
 {
@@ -157,9 +202,17 @@ bool TestRTC()
 
   while (millis() - chrono < TIMEOUT * 1000UL)
   {
-    if (rtc.begin())
+    if (PresentI2C(ADR_RTC))
     {
-      return true;
+      if (!rtc_initialisee) rtc_initialisee = rtc.begin();
+      if (rtc_initialisee)
+      {
+        if (!rtc.isrunning())
+        {
+          rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+        }
+        return true;
+      }
     }
   }
   return false;
@@ -171,9 +224,10 @@ bool TestBME280()
 
   while (millis() - chrono < TIMEOUT * 1000UL)
   {
-    if (bme.begin(ADR_BME280))
+    if (PresentI2C(ADR_BME280))
     {
-      return true;
+      if (!bme_initialise) bme_initialise = bme.begin(ADR_BME280);
+      if (bme_initialise) return true;
     }
   }
   return false;
@@ -196,25 +250,34 @@ bool TestLuminosite()
 
 bool TestGPS()
 {
+  uint32_t trames_avant = gps.passedChecksum();
   chrono = millis();
 
   while (millis() - chrono < TIMEOUT * 1000UL)
   {
     while (gpsSerial.available())
     {
-      if (gps.encode(gpsSerial.read()) && gps.location.isValid()) return true;
+      if (gps.encode(gpsSerial.read()) && gps.location.isUpdated()) return true;
     }
+    if (gps.passedChecksum() != trames_avant && millis() - chrono >= 2000UL) return true;
   }
-  return false;
+  return gps.passedChecksum() != trames_avant;
 }
+
+bool sd_initialisee = false;
 
 bool TestSDAcces()
 {
+  if (sd_initialisee) return true;
   chrono = millis();
 
   while (millis() - chrono < TIMEOUT * 1000UL)
   {
-    if (SD.begin(PIN_SD_CS)) return true;
+    if (SD.begin(PIN_SD_CS))
+    {
+      sd_initialisee = true;
+      return true;
+    }
   }
   return false;
 }
@@ -228,7 +291,7 @@ void NomFichier()
   FILE_PATH[4]  = '0' + RTC_TIME.day() / 10;
   FILE_PATH[5]  = '0' + RTC_TIME.day() % 10;
   FILE_PATH[6]  = '_';
-  FILE_PATH[7]  = '0';
+  FILE_PATH[7]  = '0' + num_revision % 10;
   FILE_PATH[8]  = '.';
   FILE_PATH[9]  = 'L';
   FILE_PATH[10] = 'O';
@@ -236,10 +299,28 @@ void NomFichier()
   FILE_PATH[12] = '\0';
 }
 
-void ModeStandard()
+bool TemperatureCoherente()
 {
-  led_color(&VERT);
-  LOG_INTERVAL = 600;
+  return TEMP_AIR >= MIN_TEMP_AIR && TEMP_AIR <= MAX_TEMP_AIR;
+}
+
+bool PressionCoherente()
+{
+  return PRESSURE >= PRESSURE_MIN && PRESSURE <= PRESSURE_MAX;
+}
+
+bool HumiditeCoherente()
+{
+  return HYGR >= 0.0f && HYGR <= 100.0f;
+}
+
+bool LuminositeCoherente()
+{
+  return LUMIN <= 1023;
+}
+
+void Mesurer(bool avec_gps)
+{
   NA_FLAGS = 0;
   if (TestBME280())
   {
@@ -248,47 +329,57 @@ void ModeStandard()
     HYGR = bme.readHumidity();
     if (!TemperatureCoherente())
     {
-      erreur_courante = &ERR_VALEURS_CAP;
+      SignalerErreur(&ERR_VALEURS_CAP);
       NA_FLAGS |= NA_TEMP;
     }
     if (!PressionCoherente())
     {
-      erreur_courante = &ERR_VALEURS_CAP;
+      SignalerErreur(&ERR_VALEURS_CAP);
       NA_FLAGS |= NA_PRESSURE;
     }
     if (!HumiditeCoherente())
     {
-      erreur_courante = &ERR_VALEURS_CAP;
+      SignalerErreur(&ERR_VALEURS_CAP);
       NA_FLAGS |= NA_HYGR;
     }
   }
   else
   {
-    erreur_courante = &ERR_ACCES_CAP;
+    SignalerErreur(&ERR_ACCES_CAP);
     NA_FLAGS |= NA_TEMP | NA_PRESSURE | NA_HYGR;
   }
   if (TestLuminosite())
   {
     if (!LuminositeCoherente())
     {
-      erreur_courante = &ERR_VALEURS_CAP;
+      SignalerErreur(&ERR_VALEURS_CAP);
       NA_FLAGS |= NA_LUMIN;
     }
   }
   else
   {
-    erreur_courante = &ERR_ACCES_CAP;
+    SignalerErreur(&ERR_ACCES_CAP);
     NA_FLAGS |= NA_LUMIN;
   }
-  if (TestGPS())
+  if (avec_gps)
   {
-    GPS_LAT = gps.location.lat();
-    GPS_LON = gps.location.lng();
-  }
-  else
-  {
-    erreur_courante = &ERR_GPS;
-    NA_FLAGS |= NA_GPS;
+    if (TestGPS())
+    {
+      if (gps.location.isUpdated())
+      {
+        GPS_LAT = gps.location.lat();
+        GPS_LON = gps.location.lng();
+      }
+      else
+      {
+        NA_FLAGS |= NA_GPS;
+      }
+    }
+    else
+    {
+      SignalerErreur(&ERR_GPS);
+      NA_FLAGS |= NA_GPS;
+    }
   }
   if (TestRTC())
   {
@@ -296,151 +387,101 @@ void ModeStandard()
   }
   else
   {
-    erreur_courante = &ERR_RTC;
+    SignalerErreur(&ERR_RTC);
     NA_FLAGS |= NA_RTC;
   }
-  if (TestSDAcces())
-  {
-    NomFichier();
-    dataFile = SD.open(FILE_PATH, FILE_WRITE);
-    if (!dataFile)
-    {
-      erreur_courante = &ERR_WRITE_SD;
-      return;
-    }
-    dataFile.print(F("Date/Heure: "));
-    dataFile.print(RTC_TIME.year(), DEC);
-    dataFile.print('/');
-    dataFile.print(RTC_TIME.month(), DEC);
-    dataFile.print('/');
-    dataFile.print(RTC_TIME.day(), DEC);
-    dataFile.print(F(" - "));
-    dataFile.print(RTC_TIME.hour(), DEC);
-    dataFile.print(':');
-    dataFile.print(RTC_TIME.minute(), DEC);
-    dataFile.print(':');
-    dataFile.print(RTC_TIME.second(), DEC);
-    dataFile.print(F(" | GPS lat, long : "));
-    if (NA_FLAGS & NA_GPS) dataFile.print(F("NA, NA"));
-    else
-    {
-      dataFile.print(GPS_LAT, 6);
-      dataFile.print(F(", "));
-      dataFile.print(GPS_LON, 6);
-    }
-    dataFile.print(F(" | Température : "));
-    if (NA_FLAGS & NA_TEMP) dataFile.print(F("NA")); else dataFile.print(TEMP_AIR);
-    dataFile.print(F(" | Pression : "));
-    if (NA_FLAGS & NA_PRESSURE) dataFile.print(F("NA")); else dataFile.print(PRESSURE);
-    dataFile.print(F(" | Humidité : "));
-    if (NA_FLAGS & NA_HYGR) dataFile.print(F("NA")); else dataFile.print(HYGR);
-    dataFile.print(F(" | Luminosité : "));
-    if (NA_FLAGS & NA_LUMIN) dataFile.print(F("NA")); else dataFile.print(LUMIN);
-    dataFile.println();
-    if (dataFile.size() >= FILE_MAX_SIZE)
-    {
-      erreur_courante = &ERR_FULL_SD;
-    }
-    dataFile.close();
-  }
+}
+
+void Ecrire(Print &sortie, bool avec_gps)
+{
+  sortie.print(F("Date/Heure: "));
+  if (NA_FLAGS & NA_RTC) sortie.print(F("NA"));
   else
   {
-    erreur_courante = &ERR_WRITE_SD;
+    sortie.print(RTC_TIME.year(), DEC);
+    sortie.print('/');
+    sortie.print(RTC_TIME.month(), DEC);
+    sortie.print('/');
+    sortie.print(RTC_TIME.day(), DEC);
+    sortie.print(F(" - "));
+    sortie.print(RTC_TIME.hour(), DEC);
+    sortie.print(':');
+    sortie.print(RTC_TIME.minute(), DEC);
+    sortie.print(':');
+    sortie.print(RTC_TIME.second(), DEC);
   }
+  if (avec_gps)
+  {
+    sortie.print(F(" | GPS lat, long : "));
+    if (NA_FLAGS & NA_GPS) sortie.print(F("NA, NA"));
+    else
+    {
+      sortie.print(GPS_LAT, 6);
+      sortie.print(F(", "));
+      sortie.print(GPS_LON, 6);
+    }
+  }
+  sortie.print(F(" | Température : "));
+  if (NA_FLAGS & NA_TEMP) sortie.print(F("NA")); else sortie.print(TEMP_AIR);
+  sortie.print(F(" | Pression : "));
+  if (NA_FLAGS & NA_PRESSURE) sortie.print(F("NA")); else sortie.print(PRESSURE);
+  sortie.print(F(" | Humidité : "));
+  if (NA_FLAGS & NA_HYGR) sortie.print(F("NA")); else sortie.print(HYGR);
+  sortie.print(F(" | Luminosité : "));
+  if (NA_FLAGS & NA_LUMIN) sortie.print(F("NA")); else sortie.print(LUMIN);
+  sortie.println();
+}
+
+void EcrireSD(bool avec_gps)
+{
+  if (!TestSDAcces())
+  {
+    SignalerErreur(&ERR_WRITE_SD);
+    return;
+  }
+  if (RTC_TIME.day() != jour_fichier)
+  {
+    jour_fichier = RTC_TIME.day();
+    num_revision = 0;
+  }
+  NomFichier();
+  while (num_revision < 9 && SD.exists(FILE_PATH))
+  {
+    File existant = SD.open(FILE_PATH, FILE_READ);
+    uint32_t taille = existant ? existant.size() : 0;
+    if (existant) existant.close();
+    if (taille < FILE_MAX_SIZE) break;
+    num_revision += 1;
+    NomFichier();
+  }
+  File fichier = SD.open(FILE_PATH, FILE_WRITE);
+  if (!fichier)
+  {
+    SignalerErreur(&ERR_WRITE_SD);
+    return;
+  }
+  Ecrire(fichier, avec_gps);
+  if (fichier.size() >= FILE_MAX_SIZE)
+  {
+    if (num_revision < 9) num_revision += 1;    // fichier plein => revision suivante
+    else SignalerErreur(&ERR_FULL_SD);          // plus de numero de revision disponible
+  }
+  fichier.close();
+}
+
+void ModeStandard()
+{
+  led_color(&VERT);
+  LOG_INTERVAL = 600;
+  Mesurer(true);
+  EcrireSD(true);
 }
 
 void ModeMaintenance()
 {
   led_color(&ORANGE);
-  NA_FLAGS = 0;
-  if (TestBME280())
-  {
-    TEMP_AIR = bme.readTemperature();
-    PRESSURE = bme.readPressure() / 100.0f;
-    HYGR = bme.readHumidity();
-    if (!TemperatureCoherente())
-    {
-      erreur_courante = &ERR_VALEURS_CAP;
-      NA_FLAGS |= NA_TEMP;
-    }
-    if (!PressionCoherente())
-    {
-      erreur_courante = &ERR_VALEURS_CAP;
-      NA_FLAGS |= NA_PRESSURE;
-    }
-    if (!HumiditeCoherente())
-    {
-      erreur_courante = &ERR_VALEURS_CAP;
-      NA_FLAGS |= NA_HYGR;
-    }
-  }
-  else
-  {
-    erreur_courante = &ERR_ACCES_CAP;
-    NA_FLAGS |= NA_TEMP | NA_PRESSURE | NA_HYGR;
-  }
-  if (TestLuminosite())
-  {
-    if (!LuminositeCoherente())
-    {
-      erreur_courante = &ERR_VALEURS_CAP;
-      NA_FLAGS |= NA_LUMIN;
-    }
-  }
-  else
-  {
-    erreur_courante = &ERR_ACCES_CAP;
-    NA_FLAGS |= NA_LUMIN;
-  }
-  if (TestGPS())
-  {
-    GPS_LAT = gps.location.lat();
-    GPS_LON = gps.location.lng();
-  }
-  else
-  {
-    erreur_courante = &ERR_GPS;
-    NA_FLAGS |= NA_GPS;
-  }
-  if (TestRTC())
-  {
-    RTC_TIME = rtc.now();
-  }
-  else
-  {
-    erreur_courante = &ERR_RTC;
-    NA_FLAGS |= NA_RTC;
-  }
-  Serial.print(F("Date/Heure: "));
-  Serial.print(RTC_TIME.year(), DEC);
-  Serial.print('/');
-  Serial.print(RTC_TIME.month(), DEC);
-  Serial.print('/');
-  Serial.print(RTC_TIME.day(), DEC);
-  Serial.print(F(" - "));
-  Serial.print(RTC_TIME.hour(), DEC);
-  Serial.print(':');
-  Serial.print(RTC_TIME.minute(), DEC);
-  Serial.print(':');
-  Serial.print(RTC_TIME.second(), DEC);
-  Serial.println();
-  Serial.print(F(" | GPS lat, long : "));
-  if (NA_FLAGS & NA_GPS) Serial.print(F("NA, NA"));
-  else
-  {
-    Serial.print(GPS_LAT, 6);
-    Serial.print(F(", "));
-    Serial.print(GPS_LON, 6);
-  }
-  Serial.print(F(" | Température : "));
-  if (NA_FLAGS & NA_TEMP) Serial.print(F("NA")); else Serial.print(TEMP_AIR);
-  Serial.print(F(" | Pression : "));
-  if (NA_FLAGS & NA_PRESSURE) Serial.print(F("NA")); else Serial.print(PRESSURE);
-  Serial.print(F(" | Humidité : "));
-  if (NA_FLAGS & NA_HYGR) Serial.print(F("NA")); else Serial.print(HYGR);
-  Serial.print(F(" | Luminosité : "));
-  if (NA_FLAGS & NA_LUMIN) Serial.print(F("NA")); else Serial.print(LUMIN);
-  Serial.println();
+  Mesurer(true);
+  Ecrire(Serial, true);
 }
 
 void ModeConfiguration()
@@ -454,169 +495,101 @@ void ModeEconomie()
 {
   led_color(&BLEU);
   LOG_INTERVAL = 1200;
-  NA_FLAGS = 0;
-  if (TestBME280())
-  {
-    TEMP_AIR = bme.readTemperature();
-    PRESSURE = bme.readPressure() / 100.0f;
-    HYGR = bme.readHumidity();
-    if (!TemperatureCoherente())
-    {
-      erreur_courante = &ERR_VALEURS_CAP;
-      NA_FLAGS |= NA_TEMP;
-    }
-    if (!PressionCoherente())
-    {
-      erreur_courante = &ERR_VALEURS_CAP;
-      NA_FLAGS |= NA_PRESSURE;
-    }
-    if (!HumiditeCoherente())
-    {
-      erreur_courante = &ERR_VALEURS_CAP;
-      NA_FLAGS |= NA_HYGR;
-    }
-  }
-  else
-  {
-    erreur_courante = &ERR_ACCES_CAP;
-    NA_FLAGS |= NA_TEMP | NA_PRESSURE | NA_HYGR;
-  }
-  if (TestLuminosite())
-  {
-    if (!LuminositeCoherente())
-    {
-      erreur_courante = &ERR_VALEURS_CAP;
-      NA_FLAGS |= NA_LUMIN;
-    }
-  }
-  else
-  {
-    erreur_courante = &ERR_ACCES_CAP;
-    NA_FLAGS |= NA_LUMIN;
-  }
-  if (BIN%2 == 0)
-  {
-    if (TestGPS())
-    {
-      GPS_LAT = gps.location.lat();
-      GPS_LON = gps.location.lng();
-    }
-    else
-    {
-      erreur_courante = &ERR_GPS;
-      NA_FLAGS |= NA_GPS;
-    }
-  }
-  if (TestRTC())
-  {
-    RTC_TIME = rtc.now();
-  }
-  else
-  {
-    erreur_courante = &ERR_RTC;
-    NA_FLAGS |= NA_RTC;
-  }
-  if (TestSDAcces())
-  {
-    NomFichier();
-    dataFile = SD.open(FILE_PATH, FILE_WRITE);
-    if (!dataFile)
-    {
-      erreur_courante = &ERR_WRITE_SD;
-      BIN += 1;
-      return;
-    }
-    dataFile.print(F("Date/Heure: "));
-    dataFile.print(RTC_TIME.year(), DEC);
-    dataFile.print('/');
-    dataFile.print(RTC_TIME.month(), DEC);
-    dataFile.print('/');
-    dataFile.print(RTC_TIME.day(), DEC);
-    dataFile.print(F(" - "));
-    dataFile.print(RTC_TIME.hour(), DEC);
-    dataFile.print(':');
-    dataFile.print(RTC_TIME.minute(), DEC);
-    dataFile.print(':');
-    dataFile.print(RTC_TIME.second(), DEC);
-    if (BIN%2 == 0)
-    {
-    dataFile.print(F(" | GPS lat, long : "));
-    if (NA_FLAGS & NA_GPS) dataFile.print(F("NA, NA"));
-    else
-    {
-      dataFile.print(GPS_LAT, 6);
-      dataFile.print(F(", "));
-      dataFile.print(GPS_LON, 6);
-    }
-    }
-    dataFile.print(F(" | Température : "));
-    if (NA_FLAGS & NA_TEMP) dataFile.print(F("NA")); else dataFile.print(TEMP_AIR);
-    dataFile.print(F(" | Pression : "));
-    if (NA_FLAGS & NA_PRESSURE) dataFile.print(F("NA")); else dataFile.print(PRESSURE);
-    dataFile.print(F(" | Humidité : "));
-    if (NA_FLAGS & NA_HYGR) dataFile.print(F("NA")); else dataFile.print(HYGR);
-    dataFile.print(F(" | Luminosité : "));
-    if (NA_FLAGS & NA_LUMIN) dataFile.print(F("NA")); else dataFile.print(LUMIN);
-    dataFile.println();
-    if (dataFile.size() >= FILE_MAX_SIZE)
-    {
-      erreur_courante = &ERR_FULL_SD;
-    }
-    dataFile.close();
-  }
-  else
-  {
-    erreur_courante = &ERR_WRITE_SD;
-  }
-  BIN += 1;
+  bool avec_gps = (COMPTEUR_ECO % 2 == 0);
+  Mesurer(avec_gps);
+  EcrireSD(avec_gps);
+  COMPTEUR_ECO += 1;
 }
 
+// Standard     : rouge long -> maintenance, vert long -> economie
+// Economie     : rouge long -> standard
+// Maintenance  : rouge long -> retour au mode precedent (standard)
+// Configuration: uniquement au demarrage (rouge appuye), sortie apres 30 min sans appui
 void ChoixMode()
 {
   ETAT_BOUTON = BOUTON();
-  if (ETAT_BOUTON == BTN_RL && (MODE == 'E' || MODE == 'S'))
+  if (MODE == 'S')
   {
-    MODE_MEMOIRE = MODE;
-    MODE = 'M';
+    if (ETAT_BOUTON == BTN_RL)
+    {
+      MODE_MEMOIRE = 'S';
+      MODE = 'M';
+    }
+    else if (ETAT_BOUTON == BTN_VL)
+    {
+      MODE = 'E';
+    }
   }
-  else if (ETAT_BOUTON == BTN_RL && MODE == 'M')
+  else if (MODE == 'E')
   {
-    MODE = MODE_MEMOIRE;
+    if (ETAT_BOUTON == BTN_RL)
+    {
+      MODE = 'S';
+    }
   }
-  else if (ETAT_BOUTON == BTN_RC)
+  else if (MODE == 'M')
   {
-    MODE = 'C';
+    if (ETAT_BOUTON == BTN_RL)
+    {
+      MODE = MODE_MEMOIRE;
+    }
   }
-  else if (ETAT_BOUTON == BTN_VL && MODE == 'S')
+  else if (MODE == 'C')
   {
-    MODE = 'E';
-  }
-  else if (ETAT_BOUTON == BTN_RL && MODE == 'E')
-  {
-    MODE = 'S';
+    if (ETAT_BOUTON != BTN_N)
+    {
+      derniere_activite_config = millis();
+    }
+    else if (millis() - derniere_activite_config >= DUREE_INACTIVITE_CONFIG)
+    {
+      MODE = 'S';
+    }
   }
 }
 
 void setup() {
+  PeindrePile();
+  ledRGB.init();
   Serial.begin(9600);
   gpsSerial.begin(9600);
   Wire.begin();
-  rtc.begin();
-  bme.begin(ADR_BME280);
-  ledRGB.init();
-  pinMode(PIN_BTN_ROUGE, INPUT_PULLUP);
-  pinMode(PIN_BTN_VERT, INPUT_PULLUP);
+  pinMode(PIN_BTN_ROUGE, BTN_APPUYE == LOW ? INPUT_PULLUP : INPUT);
+  pinMode(PIN_BTN_VERT, BTN_APPUYE == LOW ? INPUT_PULLUP : INPUT);
   pinMode(PIN_LUMINOSITE, INPUT);
-  SD.begin(PIN_SD_CS);
+  sd_initialisee = SD.begin(PIN_SD_CS);
+
+  if (Appuye(PIN_BTN_ROUGE))
+  {
+    MODE = 'C';
+    derniere_activite_config = millis();
+    while (Appuye(PIN_BTN_ROUGE)) {}
+    delay(50);
+  }
+  else
+  {
+    MODE = 'S';
+  }
+  Serial.print(F("Demarrage en mode "));
+  Serial.println(MODE);
 }
 
 void loop()
 {
-  if (debut || millis() - dernier_releve >= LOG_INTERVAL * 1000UL)
+  char ancien_mode = MODE;
+  ChoixMode();
+  if (ETAT_BOUTON != BTN_N)
   {
-    debut = false;
+    Serial.print(F("Bouton : "));
+    Serial.print(ETAT_BOUTON);
+    Serial.print(F(" -> mode "));
+    Serial.println(MODE);
+  }
+  if (premier_releve || MODE != ancien_mode || millis() - dernier_releve >= LOG_INTERVAL * 1000UL)
+  {
+    premier_releve = false;
     dernier_releve = millis();
-    if (MODE == 'S' || MODE == 'C')
+    erreur_courante = NULL;
+    if (MODE == 'S')
     {
       ModeStandard();
     }
@@ -624,14 +597,30 @@ void loop()
     {
       ModeEconomie();
     }
+    else if (MODE == 'M')
+    {
+      ModeMaintenance();
+    }
+    else if (MODE == 'C')
+    {
+      ModeConfiguration();
+    }
+    if (MODE == 'S' || MODE == 'E')
+    {
+      Ecrire(Serial, true);
+    }
+    Serial.print(F("Le mode "));
+    Serial.print(MODE);
+    Serial.print(F(" est termine (pile : "));
+    Serial.print(PileMinLibre());
+    Serial.println(F(" octets libres au minimum)"));
   }
-  ChoixMode();
   if (erreur_courante != NULL)
   {
-    while (true)
-    {
-      erreur();
-    }
+    erreur();
   }
-   delay(100);
+  else
+  {
+    delay(100);
+  }
 }
