@@ -557,7 +557,7 @@ void setup() {
   pinMode(PIN_BTN_VERT, BTN_APPUYE == LOW ? INPUT_PULLUP : INPUT);
   pinMode(PIN_LUMINOSITE, INPUT);
   sd_initialisee = SD.begin(PIN_SD_CS);
-
+  
   if (Appuye(PIN_BTN_ROUGE))
   {
     MODE = 'C';
