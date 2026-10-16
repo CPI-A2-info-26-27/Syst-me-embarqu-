@@ -2,7 +2,7 @@
 #include <Adafruit_BME280.h>
 #include <ChainableLED.h>
 #include <Wire.h>
-#include <RTClib.h>
+#include "RTClib.h"
 #include <SPI.h>
 #include <SD.h>
 #include <SoftwareSerial.h>
@@ -32,7 +32,7 @@
 #define NA_GPS       0x10
 #define NA_RTC       0x20
 
-uint16_t LOG_INTERVAL  = 60;
+uint16_t LOG_INTERVAL  = 600;
 uint16_t FILE_MAX_SIZE = 2048;
 uint8_t  TIMEOUT       = 30;
 
@@ -54,13 +54,13 @@ char FILE_PATH[13] = "";
 uint8_t COMPTEUR_ECO = 0;
 char MODE = 'S';
 char MODE_MEMOIRE = 'S';
-uint8_t num_revision = 0;        // revision du fichier du jour (AAMMJJ_N.LOG)
-uint8_t jour_fichier = 0;        // jour du fichier en cours, pour remettre la revision a 0
-bool premier_releve = true;      // force un releve des le premier passage dans loop()
+int num_revision = 0;
+bool premier_releve = true;
+bool sd_initialisee = false;
 uint32_t dernier_releve = 0;
 uint32_t chrono = 0;
-uint32_t derniere_activite_config = 0;   // dernier appui en mode configuration
-const uint32_t DUREE_INACTIVITE_CONFIG = 30UL * 60UL * 1000UL;   // 30 min sans appui => retour en standard
+uint32_t derniere_activite_config = 0;
+const uint32_t DUREE_INACTIVITE_CONFIG = 30UL * 60UL * 1000UL;
 uint8_t ETAT_BOUTON = BTN_N;
 
 Adafruit_BME280 bme;
@@ -95,30 +95,18 @@ const Erreur ERR_FULL_SD     PROGMEM = { &ROUGE, &BLANC, 1000, 1000 };
 const Erreur ERR_WRITE_SD    PROGMEM = { &ROUGE, &BLANC, 1000, 2000 };
 
 const Erreur *erreur_courante = NULL;
-bool     erreur_phase2 = false;       // false : couleur 1, true : couleur 2
-uint32_t debut_phase_erreur = 0;
 
 void SignalerErreur(const Erreur *e)
 {
-  if (erreur_courante == NULL)
-  {
-    erreur_courante = e;
-    erreur_phase2 = false;
-    debut_phase_erreur = millis();
-    led_color((const Couleur *)pgm_read_word(&e->c1));
-  }
+  if (erreur_courante == NULL) erreur_courante = e;
 }
 
-// Clignotement non bloquant : les boutons restent lus pendant l'affichage de l'erreur
 void erreur()
 {
-  uint16_t duree = pgm_read_word(erreur_phase2 ? &erreur_courante->d2 : &erreur_courante->d1);
-  if (millis() - debut_phase_erreur >= duree)
-  {
-    erreur_phase2 = !erreur_phase2;
-    debut_phase_erreur = millis();
-    led_color((const Couleur *)pgm_read_word(erreur_phase2 ? &erreur_courante->c2 : &erreur_courante->c1));
-  }
+  led_color((const Couleur *)pgm_read_word(&erreur_courante->c1));
+  delay(pgm_read_word(&erreur_courante->d1));
+  led_color((const Couleur *)pgm_read_word(&erreur_courante->c2));
+  delay(pgm_read_word(&erreur_courante->d2));
 }
 
 extern uint8_t __heap_start;
@@ -153,10 +141,7 @@ uint16_t PileMinLibre()
   return max_libre;
 }
 
-// Cablage des boutons :
-//  - bouton entre la broche et GND (aucune resistance)    -> BTN_APPUYE LOW  (INPUT_PULLUP)
-//  - bouton entre la broche et 5V + resistance 10k vers GND -> BTN_APPUYE HIGH (INPUT)
-#define BTN_APPUYE  HIGH
+#define BTN_APPUYE  LOW
 
 bool Appuye(uint8_t pin)
 {
@@ -248,6 +233,11 @@ bool TestLuminosite()
   return false;
 }
 
+bool PositionGPSRecente()
+{
+  return gps.location.isValid() && gps.location.age() < 2000UL;
+}
+
 bool TestGPS()
 {
   uint32_t trames_avant = gps.passedChecksum();
@@ -257,14 +247,12 @@ bool TestGPS()
   {
     while (gpsSerial.available())
     {
-      if (gps.encode(gpsSerial.read()) && gps.location.isUpdated()) return true;
+      gps.encode(gpsSerial.read());
     }
-    if (gps.passedChecksum() != trames_avant && millis() - chrono >= 2000UL) return true;
+    if (PositionGPSRecente()) return true;
   }
   return gps.passedChecksum() != trames_avant;
 }
-
-bool sd_initialisee = false;
 
 bool TestSDAcces()
 {
@@ -322,6 +310,7 @@ bool LuminositeCoherente()
 void Mesurer(bool avec_gps)
 {
   NA_FLAGS = 0;
+  Serial.println(F("Mesurer : BME280..."));
   if (TestBME280())
   {
     TEMP_AIR = bme.readTemperature();
@@ -348,6 +337,7 @@ void Mesurer(bool avec_gps)
     SignalerErreur(&ERR_ACCES_CAP);
     NA_FLAGS |= NA_TEMP | NA_PRESSURE | NA_HYGR;
   }
+  Serial.println(F("Mesurer : luminosite..."));
   if (TestLuminosite())
   {
     if (!LuminositeCoherente())
@@ -363,9 +353,10 @@ void Mesurer(bool avec_gps)
   }
   if (avec_gps)
   {
+    Serial.println(F("Mesurer : GPS..."));
     if (TestGPS())
     {
-      if (gps.location.isUpdated())
+      if (PositionGPSRecente())
       {
         GPS_LAT = gps.location.lat();
         GPS_LON = gps.location.lng();
@@ -381,6 +372,7 @@ void Mesurer(bool avec_gps)
       NA_FLAGS |= NA_GPS;
     }
   }
+  Serial.println(F("Mesurer : RTC..."));
   if (TestRTC())
   {
     RTC_TIME = rtc.now();
@@ -390,6 +382,7 @@ void Mesurer(bool avec_gps)
     SignalerErreur(&ERR_RTC);
     NA_FLAGS |= NA_RTC;
   }
+  Serial.println(F("Mesurer : fin"));
 }
 
 void Ecrire(Print &sortie, bool avec_gps)
@@ -432,6 +425,12 @@ void Ecrire(Print &sortie, bool avec_gps)
   sortie.println();
 }
 
+void DateFichier(uint16_t *date, uint16_t *heure)
+{
+  *date  = FAT_DATE(RTC_TIME.year(), RTC_TIME.month(), RTC_TIME.day());
+  *heure = FAT_TIME(RTC_TIME.hour(), RTC_TIME.minute(), RTC_TIME.second());
+}
+
 void EcrireSD(bool avec_gps)
 {
   if (!TestSDAcces())
@@ -439,21 +438,7 @@ void EcrireSD(bool avec_gps)
     SignalerErreur(&ERR_WRITE_SD);
     return;
   }
-  if (RTC_TIME.day() != jour_fichier)
-  {
-    jour_fichier = RTC_TIME.day();
-    num_revision = 0;
-  }
   NomFichier();
-  while (num_revision < 9 && SD.exists(FILE_PATH))
-  {
-    File existant = SD.open(FILE_PATH, FILE_READ);
-    uint32_t taille = existant ? existant.size() : 0;
-    if (existant) existant.close();
-    if (taille < FILE_MAX_SIZE) break;
-    num_revision += 1;
-    NomFichier();
-  }
   File fichier = SD.open(FILE_PATH, FILE_WRITE);
   if (!fichier)
   {
@@ -463,8 +448,11 @@ void EcrireSD(bool avec_gps)
   Ecrire(fichier, avec_gps);
   if (fichier.size() >= FILE_MAX_SIZE)
   {
-    if (num_revision < 9) num_revision += 1;    // fichier plein => revision suivante
-    else SignalerErreur(&ERR_FULL_SD);          // plus de numero de revision disponible
+    if (num_revision < 9) 
+    {
+      num_revision += 1;
+    }
+    else SignalerErreur(&ERR_FULL_SD);
   }
   fichier.close();
 }
@@ -472,7 +460,8 @@ void EcrireSD(bool avec_gps)
 void ModeStandard()
 {
   led_color(&VERT);
-  LOG_INTERVAL = 600;
+  Serial.println(F("Mode S : debut"));
+  LOG_INTERVAL = 180;
   Mesurer(true);
   EcrireSD(true);
 }
@@ -501,10 +490,6 @@ void ModeEconomie()
   COMPTEUR_ECO += 1;
 }
 
-// Standard     : rouge long -> maintenance, vert long -> economie
-// Economie     : rouge long -> standard
-// Maintenance  : rouge long -> retour au mode precedent (standard)
-// Configuration: uniquement au demarrage (rouge appuye), sortie apres 30 min sans appui
 void ChoixMode()
 {
   ETAT_BOUTON = BOUTON();
@@ -518,6 +503,13 @@ void ChoixMode()
     else if (ETAT_BOUTON == BTN_VL)
     {
       MODE = 'E';
+    }
+    if (ETAT_BOUTON == BTN_RC)
+    {
+      if (ETAT_BOUTON == BTN_VC)
+      {
+        MODE = 'C';
+      }
     }
   }
   else if (MODE == 'E')
@@ -556,21 +548,12 @@ void setup() {
   pinMode(PIN_BTN_ROUGE, BTN_APPUYE == LOW ? INPUT_PULLUP : INPUT);
   pinMode(PIN_BTN_VERT, BTN_APPUYE == LOW ? INPUT_PULLUP : INPUT);
   pinMode(PIN_LUMINOSITE, INPUT);
-  sd_initialisee = SD.begin(PIN_SD_CS);
-  
   if (Appuye(PIN_BTN_ROUGE))
   {
     MODE = 'C';
-    derniere_activite_config = millis();
-    while (Appuye(PIN_BTN_ROUGE)) {}
-    delay(50);
   }
-  else
-  {
-    MODE = 'S';
-  }
-  Serial.print(F("Demarrage en mode "));
-  Serial.println(MODE);
+  SdFile::dateTimeCallback(DateFichier);
+  sd_initialisee = SD.begin(PIN_SD_CS);
 }
 
 void loop()
@@ -617,7 +600,10 @@ void loop()
   }
   if (erreur_courante != NULL)
   {
-    erreur();
+    while (true)
+    {
+      erreur();
+    }
   }
   else
   {
