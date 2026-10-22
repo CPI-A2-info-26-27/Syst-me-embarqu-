@@ -461,7 +461,7 @@ void ModeStandard()
 {
   led_color(&VERT);
   Serial.println(F("Mode S : debut"));
-  LOG_INTERVAL = 180;
+  LOG_INTERVAL = 600;
   Mesurer(true);
   EcrireSD(true);
 }
@@ -583,7 +583,7 @@ void loop()
     else if (MODE == 'M')
     {
       ModeMaintenance();
-    }
+    } 
     else if (MODE == 'C')
     {
       ModeConfiguration();
